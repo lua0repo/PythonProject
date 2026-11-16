@@ -1,0 +1,1741 @@
+#!/usr/bin/env python3
+"""
+MULTI-TYPE ANALYZER v3 - your full analysis + honest validation layer
+====================================================================
+What changed from your previous version (everything else is unchanged):
+
+P0  Walk-forward backtest. Each method predicts draw t using ONLY draws
+    before t, then is scored against draw t. (The old backtest_hits()
+    scored a prediction against the same draws it was built from.)
+P0  Exact random baseline per game type, and Benjamini-Hochberg (BH)
+    correction across EVERY type x method tested in the run.
+P0  Number range comes from TYPE_CONFIG, not from whatever draws are
+    loaded (old: Type4 could never pick 42, Type6 never 49, Type7 never 51-55).
+P1  find_best() picks only a method that clears BH < 0.05 with enough
+    trials. Otherwise it prints "NO EDGE" - all picks have equal odds.
+P1  Every pick is finalized: pool types = 6 unique numbers in range,
+    positional types = n digits in range, order kept, never sorted.
+
+Bug fixes:
+  - CustomLinearRegression ALWAYS had slope 0 (numpy shape broadcast), so
+    every "ML Regression" in the old script returned the plain average.
+    This is why the difference model always predicted +1 on every ball.
+  - String sorting of "SET_n" keys (SET_9 sorted after SET_10) in
+    FunctionalClassifier and LagMemoryEngine -> numeric sort.
+  - Even/Odd regression could predict a negative count -> crash. Clamped.
+  - Segment combo filled with random numbers then de-duplicated, so it
+    could return < 6 numbers. Now finalized.
+  - Ensemble no longer counts Best Scored; Weighted Consensus no longer
+    counts the Ensemble vote (no method votes for its own output).
+  - LagMemoryEngine ranges/element count now follow the game type.
+  - RNGCracker removed: it was never called, its LCG/LFSR checks always
+    returned None, and its "MT" path just returned seeded random numbers.
+  - Half-size candidate subsets removed: they were always filtered out.
+  - UPS banner no longer hard-coded to "SET_24".
+  - Deep learning is OFF by default and labeled UNVALIDATED (too slow to
+    walk-forward). Turn on with RUN_DEEP_LEARNING = True.
+
+HOW TO USE (Colab or terminal)
+  1. Put history in data_types (oldest first) or point CSV_PATHS at files
+     (one draw per line). The draw you want to predict must NOT be in it.
+  2. Optional: after the draw, put the result in RESULTS to score picks.
+     RESULTS is never merged into history.
+  3. Run. Optional terminal flags: --selftest, --quick (skip backtest).
+
+A method marked "no edge" has no demonstrated advantage over a random
+ticket. A method that clears BH describes past data, not the next draw.
+"""
+from collections import defaultdict, Counter
+from itertools import combinations
+import pandas as pd
+import numpy as np
+import math, itertools, statistics, random, json, sys, io, re, contextlib, argparse
+from math import comb as n_choose_k
+
+# ==========================================
+# CONFIG
+# ==========================================
+SEED = 42                 # every run of every method is re-seeded -> repeatable
+MIN_HISTORY = 20          # draws needed before the first backtest trial
+TRIAL_FLOOR = 20          # fewer trials than this = "too few to conclude"
+MAX_TRIALS = 100          # backtest only the most recent N trials (speed)
+ALPHA = 0.05
+RUN_BACKTEST = True
+RUN_DEEP_LEARNING = False
+
+# Game shape per type. Positional = digits, order matters, repeats allowed.
+# Assumption: Type1 = 3D, Type2 = 4D, Type3 = 6D (slot counts taken from your data).
+TYPE_CONFIG = {
+    "Type1": {"name": "3D (Swertres)",    "positional": True,  "n_slots": 3, "min_val": 0, "max_val": 9},
+    "Type2": {"name": "4D",               "positional": True,  "n_slots": 4, "min_val": 0, "max_val": 9},
+    "Type3": {"name": "6D Lotto",         "positional": True,  "n_slots": 6, "min_val": 0, "max_val": 9},
+    "Type4": {"name": "Lotto 6/42",       "positional": False, "n_slots": 6, "min_val": 1, "max_val": 42},
+    "Type5": {"name": "Megalotto 6/45",   "positional": False, "n_slots": 6, "min_val": 1, "max_val": 45},
+    "Type6": {"name": "Superlotto 6/49",  "positional": False, "n_slots": 6, "min_val": 1, "max_val": 49},
+    "Type7": {"name": "Grandlotto 6/55",  "positional": False, "n_slots": 6, "min_val": 1, "max_val": 55},
+    "Type8": {"name": "Ultra Lotto 6/58", "positional": False, "n_slots": 6, "min_val": 1, "max_val": 58},
+}
+
+# Optional: load history from files instead, e.g. {"Type8": "/content/g58.csv"}
+CSV_PATHS = {}
+
+# Optional: actual results, filled in AFTER the draw. Never merged into history.
+# e.g. RESULTS = {"Type8": [14, 15, 18, 26, 33, 46]}
+RESULTS = {}
+
+# ==========================================
+# DATA DEFINITION (history only, oldest first)
+# ==========================================
+data_types = {
+    "Type1": {
+        "SET_1": [8, 3, 2],
+        "SET_2": [6, 1, 3],
+        "SET_3": [8, 3, 0],
+        "SET_4": [0, 6, 9],
+        "SET_5": [7, 2, 0],
+    },
+    "Type2": {
+        "SET_1": [8, 9, 0, 7],
+        "SET_2": [3, 8, 6, 2],
+        "SET_3": [3, 7, 6, 8],
+        "SET_4": [5, 2, 0, 7],
+        "SET_5": [3, 3, 1, 1],
+    },
+    "Type3": {
+        "SET_1": [0, 4, 8, 1, 5, 8],
+        "SET_2": [3, 2, 8, 3, 9, 1],
+        "SET_3": [7, 9, 0, 4, 2, 3],
+        "SET_4": [6, 9, 2, 2, 2, 4],
+        "SET_5": [7, 9, 7, 2, 4, 8],
+    },
+    "Type4": {"SET_1": [5, 21, 29, 35, 36, 37],
+              "SET_2": [4, 9, 11, 15, 22, 33],
+              "SET_3": [9, 10, 23, 24, 37, 41],
+              "SET_4": [1, 17, 19, 22, 26, 32],
+              "SET_5": [9, 12, 15, 16, 35, 37]},
+    "Type5": {"SET_1": [2, 6, 12, 15, 29, 41],
+              "SET_2": [14, 22, 25, 27, 31, 34],
+              "SET_3": [5, 6, 23, 34, 37, 43],
+              "SET_4": [8, 16, 32, 37, 44, 45],
+              "SET_5": [8, 11, 12, 17, 32, 33]},
+    "Type6": {"SET_1": [14, 16, 21, 35, 37, 43],
+              "SET_2": [10, 13, 19, 36, 43, 45],
+              "SET_3": [1, 8, 11, 18, 35, 40],
+              "SET_4": [1, 9, 33, 34, 44, 48],
+              "SET_5": [5, 9, 16, 27, 34, 42]},
+    "Type7": {"SET_1": [6, 13, 24, 33, 42, 45],
+              "SET_2": [3, 15, 20, 33, 45, 50],
+              "SET_3": [19, 34, 37, 38, 41, 44],
+              "SET_4": [8, 13, 14, 31, 32, 44],
+              "SET_5": [7, 9, 11, 36, 43, 47]},
+    "Type8": {"SET_1": [8, 22, 32, 33, 40, 53],
+              "SET_2": [10, 15, 17, 31, 43, 50],
+              "SET_3": [6, 14, 24, 38, 50, 57],
+              "SET_4": [2, 8, 21, 31, 34, 42],
+              "SET_5": [9, 19, 20, 22, 30, 58]},
+}
+
+all_type_predictions = {}
+
+
+# ==========================================
+# VALIDATION HELPERS (new)
+# ==========================================
+def set_key_num(k):
+    return int(k.split('_')[1])
+
+def load_csv(path):
+    out = []
+    for line in open(path):
+        nums = [int(x) for x in re.split(r'[,\s;]+', line.strip()) if x.strip().lstrip('-').isdigit()]
+        if nums:
+            out.append(nums)
+    return out
+
+def validate_draws(type_name, draws):
+    cfg = TYPE_CONFIG[type_name]
+    problems, seen = [], {}
+    for i, d in enumerate(draws, 1):
+        if len(d) != cfg["n_slots"] or not all(cfg["min_val"] <= n <= cfg["max_val"] for n in d):
+            problems.append(f"SET_{i}: wrong length or out of range {d}")
+        elif not cfg["positional"] and len(set(d)) != len(d):
+            problems.append(f"SET_{i}: repeated number in a pool draw {d}")
+        key = tuple(d) if cfg["positional"] else tuple(sorted(d))
+        if key in seen:   # flagged, never removed
+            problems.append(f"SET_{i}: same as SET_{seen[key]} {list(key)} - check official result")
+        seen.setdefault(key, i)
+    return problems
+
+def finalize_pick(pred, cfg, fallback_rank):
+    """Make any method's output a legal ticket for this game.
+    Pool: unique, in range, filled from fallback_rank, sorted.
+    Positional: clipped to range, padded from fallback_rank, order kept."""
+    n, lo, hi = cfg["n_slots"], cfg["min_val"], cfg["max_val"]
+    vals = []
+    for v in (pred or []):
+        try:
+            vals.append(int(round(float(v))))
+        except (TypeError, ValueError):
+            continue
+    vals = [min(hi, max(lo, v)) for v in vals]
+    if cfg["positional"]:
+        vals = vals[:n]
+        fill = [v for v in fallback_rank]
+        i = 0
+        while len(vals) < n:
+            vals.append(fill[i % len(fill)] if fill else lo)
+            i += 1
+        return vals
+    out = list(dict.fromkeys(vals))[:n]
+    for v in fallback_rank:
+        if len(out) >= n:
+            break
+        if v not in out:
+            out.append(v)
+    return sorted(out)
+
+def score_pick(pick, actual, cfg):
+    if cfg["positional"]:
+        return sum(1 for a, b in zip(pick, actual) if a == b)
+    return len(set(pick) & set(actual))
+
+def null_distribution(cfg):
+    """Exact P(k matches) for one random ticket."""
+    n = cfg["n_slots"]
+    if cfg["positional"]:
+        p = 1.0 / (cfg["max_val"] - cfg["min_val"] + 1)
+        return np.array([n_choose_k(n, k) * p**k * (1 - p)**(n - k) for k in range(n + 1)])
+    N = cfg["max_val"] - cfg["min_val"] + 1
+    return np.array([n_choose_k(n, k) * n_choose_k(N - n, n - k) / n_choose_k(N, n) for k in range(n + 1)])
+
+def p_total_at_least(total, n_trials, pk):
+    d = np.array([1.0])
+    for _ in range(n_trials):
+        d = np.convolve(d, pk)
+    return float(d[total:].sum())
+
+def bh_adjust(pvals):
+    m = len(pvals)
+    if m == 0:
+        return np.array([])
+    order = np.argsort(pvals)
+    adj = np.empty(m)
+    prev = 1.0
+    for rank in range(m - 1, -1, -1):
+        j = order[rank]
+        prev = min(prev, pvals[j] * m / (rank + 1))
+        adj[j] = prev
+    return adj
+
+def popularity_flags(pick, cfg):
+    """Pool games only. Does NOT change win odds; flags jackpot-sharing risk."""
+    if cfg["positional"]:
+        return "n/a"
+    flags = []
+    low = sum(n <= 31 for n in pick)
+    if low >= 5: flags.append(f"{low}/6 in 1-31")
+    runs = sum(1 for a, b in zip(pick, pick[1:]) if b - a == 1)
+    if runs >= 2: flags.append(f"{runs} consecutive pairs")
+    if len({b - a for a, b in zip(pick, pick[1:])}) == 1: flags.append("arithmetic pattern")
+    return "; ".join(flags) or "none"
+
+
+# ==========================================
+# GLOBAL CLASSES (unchanged)
+# ==========================================
+class CustomLinearRegression:
+    def __init__(self):
+        self.slope = 0
+        self.intercept = 0
+
+    def fit(self, X, y):
+        # FIX: X used to be shape (n,1) and y shape (n,), so numpy broadcast
+        # them into an n x n grid. ss_xy then always summed to 0 -> slope was
+        # ALWAYS 0 and every "regression" just returned the average.
+        X = np.array(X, dtype=float).flatten()
+        y = np.array(y, dtype=float).flatten()
+        mean_x = np.mean(X)
+        mean_y = np.mean(y)
+        ss_xy = np.sum((X - mean_x) * (y - mean_y))
+        ss_xx = np.sum((X - mean_x) ** 2)
+        self.slope = ss_xy / ss_xx if ss_xx != 0 else 0
+        self.intercept = mean_y - self.slope * mean_x
+
+    def predict(self, X_new):
+        X_new = np.array(X_new, dtype=float).flatten()
+        preds = self.intercept + self.slope * X_new
+        if len(preds) == 1:
+            return float(preds[0])
+        return preds.tolist()
+
+class AdaptiveRegimeEngine:
+    def __init__(self, window=15, n_balls=6):
+        self.window = window
+        self.n_balls = n_balls
+        self.balls = [f'Ball_{i+1}' for i in range(n_balls)]
+        self.alpha = 0.25
+        self.beta = 0.35
+        self.gamma = 0.40
+        self.W = np.array([1.0/n_balls] * n_balls)
+        self.v_shock = np.vectorize(self._get_shock_intensity)
+
+    def _get_shock_intensity(self, val):
+        abs_val = abs(val)
+        if abs_val <= 5: return 0.1
+        elif 6 <= abs_val <= 12: return 0.4
+        else: return 1.0
+
+    def _update_weights(self, df_window):
+        E = df_window.var().fillna(0).values
+        S_count = self.v_shock(df_window.values).mean(axis=0)
+        total_abs_move = df_window.abs().sum(axis=1)
+        R = df_window.apply(lambda x: x.corr(total_abs_move)).fillna(0).values
+        E_norm = E / (E.max() + 1e-8)
+        S_norm = S_count / (S_count.max() + 1e-8)
+        R_norm = R / (np.abs(R).max() + 1e-8)
+        W_new = self.W * (1 + self.alpha * E_norm + self.beta * S_norm + self.gamma * R_norm)
+        self.W = W_new / W_new.sum()
+        return self.W
+
+    def _calculate_rvi(self, df_window):
+        V = df_window.abs().mean().values
+        S = self.v_shock(df_window.values).mean(axis=0)
+        return np.sum(self.W * (V + 2.5 * S))
+
+    def _calculate_shock_prob(self, df_window, rvi):
+        S = self.v_shock(df_window.values).mean(axis=0)
+        p_shock = np.sum(self.W * S)
+        volatility_bias = rvi / 10.0
+        return min(p_shock * (1 + volatility_bias), 1.0)
+
+    def _learn_causality(self, df_window):
+        couplings = {}
+        for i, b_i in enumerate(self.balls):
+            for j, b_j in enumerate(self.balls):
+                if i != j:
+                    corr = df_window[b_i].iloc[:-1].corr(df_window[b_j].iloc[1:])
+                    if not np.isnan(corr):
+                        couplings[(b_i, b_j)] = abs(corr)
+        return sorted(couplings.items(), key=lambda x: x[1], reverse=True)[:3]
+
+    def _forecast(self, df_window, causality_graph):
+        baseline = -df_window.mean().values
+        bias_correction = -np.sign(baseline) * (df_window.abs().mean().values * 0.5)
+        propagation = np.zeros(self.n_balls)
+        last_row = df_window.iloc[-1].values
+        for (b_i, b_j), strength in causality_graph:
+            j_idx = self.balls.index(b_j)
+            i_idx = self.balls.index(b_i)
+            propagation[j_idx] += last_row[i_idx] * strength * 0.3
+        return np.round(baseline + bias_correction + propagation, 1)
+
+    def run_analysis(self, true_diff_df):
+        df_window = true_diff_df.tail(self.window).copy()
+        weights = self._update_weights(df_window)
+        rvi = self._calculate_rvi(df_window)
+
+        if rvi >= 9.0: regime = "🔴 SHOCK CYCLE"
+        elif rvi >= 6.0: regime = "🟠 MEAN REVERSION"
+        elif rvi >= 3.0: regime = "🟡 TRANSITION"
+        else: regime = "🟢 CALM"
+
+        p_shock = self._calculate_shock_prob(df_window, rvi)
+        shock_band = "CRITICAL" if p_shock >= 0.8 else ("ELEVATED" if p_shock >= 0.5 else "NORMAL")
+
+        last_deltas = true_diff_df.iloc[-1].values
+        shock_contribs = weights * last_deltas
+        heatmap_ranks = np.argsort(np.abs(shock_contribs))[::-1]
+
+        max_delta_idx = np.argmax(np.abs(last_deltas))
+        justification = f"[Multi-node expansion: {self.balls[max_delta_idx]} breaching threshold with Δ={last_deltas[max_delta_idx]:.1f}. RVI driven to {rvi:.2f}.]"
+        causality = self._learn_causality(df_window)
+
+        if regime == "🔴 SHOCK CYCLE": probs = {"SHOCK": 0.30, "MEAN REVERSION": 0.50, "TRANSITION": 0.15, "CALM": 0.05}
+        elif regime == "🟠 MEAN REVERSION": probs = {"SHOCK": 0.10, "MEAN REVERSION": 0.40, "TRANSITION": 0.35, "CALM": 0.15}
+        elif regime == "🟡 TRANSITION": probs = {"SHOCK": 0.25, "MEAN REVERSION": 0.15, "TRANSITION": 0.40, "CALM": 0.20}
+        else: probs = {"SHOCK": 0.05, "MEAN REVERSION": 0.10, "TRANSITION": 0.25, "CALM": 0.60}
+
+        next_regime = max(probs, key=probs.get)
+        next_regime_emoji = {"SHOCK": "🔴", "MEAN REVERSION": "🟠", "TRANSITION": "🟡", "CALM": "🟢"}
+        forecast = self._forecast(df_window, causality)
+
+        print("\n" + "="*50)
+        print("🧠 ADAPTIVE REGIME & SHOCK ANALYSIS v2.0  (descriptive - not validated)")
+        print("="*50)
+        print("## 1. UPDATED WEIGHTS")
+        for i, b in enumerate(self.balls): print(f"* {b}: {weights[i]:.3f}")
+        print(f"*(ΣW = {weights.sum():.3f}*)\n")
+        print("## 2. RVI SCORE")
+        print(f"* Value: {rvi:.2f}")
+        print(f"* Regime State: {regime}\n")
+        print("## 3. SHOCK PROBABILITY")
+        print(f"* Value: {p_shock:.3f}")
+        print(f"* Band: {shock_band}\n")
+        print("## 4. SHOCK HEATMAP")
+        for rank, idx in enumerate(heatmap_ranks):
+            print(f"* Rank {rank+1}: {self.balls[idx]} (Contribution: {shock_contribs[idx]:.3f} | Δ: {last_deltas[idx]:.1f})")
+        print()
+        print("## 5. REGIME CLASSIFICATION")
+        print(f"* Label: {regime}")
+        print(f"* Learned Justification Signal: {justification}\n")
+        print("## 6. CROSS-BALL LEARNED GRAPH")
+        for (b_i, b_j), strength in causality:
+            print(f"* Strongest Coupling: {b_i} → {b_j} (λ: {strength:.2f})")
+        print("* Propagation Directionality: Sequential cascade derived from lead-lag correlation.\n")
+        print("## 7. NEXT REGIME DISTRIBUTION")
+        for state, prob in probs.items(): print(f"* {state}: {int(prob*100)}%")
+        print(f"*(ΣP = 100%)*\n")
+        print("## 8. FORECAST VECTOR (LEARNED)")
+        for i, b in enumerate(self.balls): print(f"* {b}: {forecast[i]:.1f}")
+        print("*(Bias Correction: Active mean-reversion pull. Propagation Effect: Lead-lag applied)*\n")
+        print("## 9. FINAL TRANSITION")
+        print(f"{regime} → {next_regime_emoji[next_regime]} {next_regime.upper()}")
+
+
+# ==========================================
+# FULL ANALYSIS FOR ONE TYPE (your methods, wrapped in a function so the
+# backtest can re-run them on earlier slices of history)
+# ==========================================
+def analyze_type(type_name, historical_data):
+    random.seed(SEED)
+    np.random.seed(SEED)
+    cfg = TYPE_CONFIG[type_name]
+
+    print("\n" + "="*50)
+    print(f"PROCESSING DATA TYPE: {type_name} - {cfg['name']}")
+    print("="*50)
+
+    DISABLE_SORTING = cfg["positional"]
+    if DISABLE_SORTING:
+        print("⚠️  SORTING DISABLED FOR THIS TYPE - Preserving original order")
+
+    set_names = list(historical_data.keys())
+    all_sets = list(historical_data.values())
+    if not all_sets:
+        print("No data available.")
+        return {}
+
+    n_balls = cfg["n_slots"]
+    if not all(len(s) == n_balls for s in all_sets):
+        print("Inconsistent set lengths.")
+        return {}
+
+    all_nums_flat = [num for nums in all_sets for num in nums]
+    # FIX: range from the game, not from the loaded draws
+    min_number = cfg["min_val"]
+    max_number = cfg["max_val"]
+
+    num_segments = min(6, max_number - min_number + 1)
+    segment_size = (max_number - min_number + 1) // num_segments
+    segments_bounds = []
+    current = min_number
+    for i in range(num_segments):
+        end = current + segment_size - 1 if i < num_segments - 1 else max_number
+        segments_bounds.append((current, end))
+        current = end + 1
+
+    def prepare_dataframe(data_dict):
+        df = pd.DataFrame(data_dict).T
+        df.columns = [f"Ball_{i+1}" for i in range(len(df.columns))]
+        return df
+
+    class DifferencePredictor:
+        def __init__(self, dataframe):
+            self.df = dataframe
+            self.diff_df = self.compute_differences()
+            self.regime_engine = AdaptiveRegimeEngine(window=15, n_balls=n_balls)
+
+        def compute_differences(self):
+            diff_df = self.df.diff().iloc[1:]
+            diff_df.index = [f"{prev} -> {curr}" for prev, curr in zip(self.df.index[:-1], self.df.index[1:])]
+            return diff_df
+
+        def display_differences(self):
+            print("-" * 40)
+            print("DIFFERENCES BETWEEN CONSECUTIVE SETS")
+            print("-" * 40)
+            true_history_diff = self.diff_df.copy()
+            predicted_diff = self.predict_diffs_regression()
+            self.diff_df.loc['ML PREDICTION'] = predicted_diff
+            highest_counts = []
+            for col in self.diff_df.columns:
+                mode_val = self.diff_df[col].mode()
+                highest_counts.append(mode_val.iloc[0] if not mode_val.empty else np.nan)
+            self.diff_df.loc['HIGHEST COUNT'] = highest_counts
+            print(self.diff_df.to_string())
+
+            last_set = [int(x) for x in self.df.iloc[-1].tolist()]
+            pre_Deff_set = [max(min_number, min(max_number, last_set[i] + predicted_diff[i])) for i in range(n_balls)]
+            if not DISABLE_SORTING:
+                pre_Deff_set = sorted(pre_Deff_set)
+
+            print("\nPredicted Difference from Last SET (ML Regression) =>", ' '.join(map(str, predicted_diff)))
+            print("Predicted SET_N =>", pre_Deff_set)
+            print(f"✅Reusable pre_Deff_set: {pre_Deff_set}")
+            if len(true_history_diff) >= 2:
+                self.regime_engine.run_analysis(true_history_diff)
+            return pre_Deff_set
+
+        def predict_diffs_regression(self):
+            predicted_diff = []
+            time_steps = list(range(1, len(self.diff_df) + 1))
+            for col in self.diff_df.columns:
+                y = self.diff_df[col].tolist()
+                model = CustomLinearRegression()
+                model.fit(time_steps, y)
+                predicted_diff.append(int(round(model.predict(len(time_steps) + 1))))
+            return predicted_diff
+
+    df = prepare_dataframe(historical_data)
+    predictor_model = DifferencePredictor(df)
+    pre_Deff_set = predictor_model.display_differences()
+
+    # -------------------------------
+    # EVEN/ODD ANALYSIS
+    # -------------------------------
+    print("\n" + "-" * 40)
+    print("EVEN And ODD Details")
+    print("-" * 40)
+    print("Set Name Even# Odd# ET# OT#")
+    total_even = total_odd = total_et = total_ot = 0
+    even_odd_profiles, even_counts, odd_counts, et_sums, ot_sums = [], [], [], [], []
+
+    for name, numbers in historical_data.items():
+        evens = [n for n in numbers if n % 2 == 0]
+        odds = [n for n in numbers if n % 2 != 0]
+        even_sum, odd_sum = sum(evens), sum(odds)
+        total_even += len(evens); total_odd += len(odds)
+        total_et += even_sum; total_ot += odd_sum
+        even_odd_profiles.append([len(evens), len(odds), even_sum, odd_sum])
+        even_counts.append(len(evens)); odd_counts.append(len(odds))
+        et_sums.append(even_sum); ot_sums.append(odd_sum)
+        print(f"{name:<10} {len(evens):<7} {len(odds):<6} {even_sum:<6} {odd_sum:<6}")
+
+    num_sets = len(all_sets)
+    time_steps = list(range(1, num_sets + 1))
+
+    def reg_next(vals):
+        r = CustomLinearRegression()
+        r.fit(time_steps, vals)
+        return round(r.predict(num_sets + 1))
+
+    # FIX: counts clamped to 0..n_balls (regression could go negative -> crash)
+    pred_even_count = max(0, min(n_balls, reg_next(even_counts)))
+    pred_odd_count = max(0, min(n_balls, reg_next(odd_counts)))
+    pred_et, pred_ot = reg_next(et_sums), reg_next(ot_sums)
+
+    print(f"{'Predicted':<10} {pred_even_count:<7} {pred_odd_count:<6} {pred_et:<6} {pred_ot:<6}")
+    print("-" * 40)
+    print(f"TOTAL => Even Total# {total_even}, Odd Total# {total_odd} => ET# {total_et}, OT# {total_ot}")
+    print(f"P Count=> Even # {pred_even_count}, Odd # {pred_odd_count} => ET# {pred_et}, OT# {pred_ot}")
+    print(f"Predicted sums: {pred_ot} {pred_et} total {round(pred_et + pred_ot)}")
+    print("-" * 40)
+
+    num_freq = Counter(all_nums_flat)
+    hot_evens = [n for n, _ in num_freq.most_common() if n % 2 == 0][:10]
+    hot_odds = [n for n, _ in num_freq.most_common() if n % 2 != 0][:10]
+    pre_EandO_set = random.sample(hot_evens, min(pred_even_count, len(hot_evens))) + \
+                    random.sample(hot_odds, min(pred_odd_count, len(hot_odds)))
+    if not DISABLE_SORTING:
+        pre_EandO_set = sorted(pre_EandO_set)
+    print(f"✅Predicted E & O => {pre_EandO_set}")
+
+    # -------------------------------
+    # CUSTOM KNN-LIKE PREDICTOR
+    # -------------------------------
+    class HistoricalKNNPredictor:
+        def __init__(self, k=3):
+            self.k = k
+            self.profiles, self.sets = [], []
+
+        def fit(self, profiles, sets):
+            self.profiles, self.sets = profiles, sets
+
+        def _euclidean_distance(self, a, b):
+            return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    class EnhancedKNNPredictor(HistoricalKNNPredictor):
+        def __init__(self, k=5, recency_weight=0.8):
+            super().__init__(k)
+            self.recency_weight = recency_weight
+
+        def _get_nearest_neighbors(self, input_profile):
+            distances = []
+            for i, profile in enumerate(self.profiles):
+                dist = self._euclidean_distance(input_profile, profile)
+                recency_factor = (len(self.profiles) - i) / len(self.profiles) * self.recency_weight
+                distances.append((dist * (1 - recency_factor), self.sets[i]))
+            distances.sort(key=lambda x: x[0])
+            return [s for _, s in distances[:self.k]]
+
+        def predict(self, input_profile):
+            neighbors = self._get_nearest_neighbors(input_profile)
+            predicted = []
+            for pos in range(n_balls):
+                pos_nums = [s[pos] for s in neighbors if len(s) > pos]
+                predicted.append(round(sum(pos_nums) / len(pos_nums)) if pos_nums else 0)
+            predicted = list(set(predicted))
+            if not DISABLE_SORTING:
+                predicted = sorted(predicted)
+            while len(predicted) < n_balls:
+                predicted.append(predicted[-1] + 1 if predicted else min_number)
+            return predicted[:n_balls]
+
+    enhanced_knn = EnhancedKNNPredictor(k=5, recency_weight=0.8)
+    enhanced_knn.fit(even_odd_profiles, all_sets)
+    pre_EandO_set = enhanced_knn.predict(even_odd_profiles[-1])
+    print(f"✅KNN-Like Predicted E & O => {pre_EandO_set}")
+
+    # -------------------------------
+    # AVAILABLE NUMBERS
+    # -------------------------------
+    class NumberPredictor:
+        def __init__(self, historical_data):
+            self.historical_data = historical_data
+            self.sorted_keys = sorted(historical_data.keys(), key=set_key_num)
+            self.frequency_count = defaultdict(int)
+            for key in self.sorted_keys:
+                for num in self.historical_data[key]:
+                    self.frequency_count[num] += 1
+
+        def display_number_frequency(self):
+            print("\n" + "-" * 40)
+            print("AVAILABLE NUMBER")
+            print("-" * 40)
+            print("Available numbers based on Range Limit:")
+            for i in range(min_number, max_number + 1):
+                print(f"{i} = {self.frequency_count[i]}", end=" ")
+                if i % 5 == 0:
+                    print()
+
+        def display_position_frequencies(self):
+            last_5_keys = self.sorted_keys[-5:]
+            position_totals = [0] * n_balls
+            print("\n" + "-" * 40)
+            print("POSITIONAL FREQUENCY BREAKDOWN (Last 5 Sets):")
+            print("-" * 40)
+            for key in last_5_keys:
+                nums = self.historical_data[key]
+                line = f"{key}: "
+                for i, num in enumerate(nums):
+                    freq = self.frequency_count[num]
+                    position_totals[i] += freq
+                    line += f"{num}:{freq} "
+                print(line.strip())
+            print("\nTOTALS:")
+            for i, total in enumerate(position_totals):
+                print(f"B{i + 1}: {total}", end=" ")
+            print()
+            print("\nMEAN:")
+            num_last = min(5, len(self.sorted_keys))
+            means = [round(total / num_last) for total in position_totals]
+            for i, mean in enumerate(means):
+                print(f"B{i + 1}: {mean}", end=" ")
+            print()
+            return means
+
+    num_predictor = NumberPredictor(historical_data)
+    num_predictor.display_number_frequency()
+    num_predictor.display_position_frequencies()
+
+    predicted_pos_means = []
+    for pos in range(n_balls):
+        reg = CustomLinearRegression()
+        reg.fit(time_steps, [s[pos] for s in all_sets])
+        predicted_pos_means.append(round(reg.predict(num_sets + 1)))
+    print("\nPredicted Pos Means (Regression):", predicted_pos_means)
+    prediction_AN = predicted_pos_means if DISABLE_SORTING else sorted(predicted_pos_means)
+    next_set_number = set_key_num(num_predictor.sorted_keys[-1]) + 1
+    print(f"\n✅ Predicted SET_{next_set_number} Based on KNN logic => {prediction_AN}")
+
+    # -------------------------------
+    # POSITION FREQUENCIES
+    # -------------------------------
+    position_data = {i + 1: [] for i in range(n_balls)}
+    for numbers in historical_data.values():
+        for i, num in enumerate(numbers):
+            position_data[i + 1].append(num)
+    freqs = {pos: Counter(nums) for pos, nums in position_data.items()}
+
+    Bmost_frequent_numbers = [freqs[pos].most_common(1)[0][0] for pos in sorted(freqs)]
+    print(f"\n✅ Ball Frequency Position => {Bmost_frequent_numbers}")
+    print("\n", "-" * 40)
+    print("POSITION FREQUENCIES")
+    print("-" * 40)
+    for pos, counter in sorted(freqs.items()):
+        print(f"Ball #{pos}: {dict(counter)}")
+    print("\n", "-" * 40)
+    print("POSITION FREQUENCY SUMS")
+    print("-" * 40)
+    for pos, nums in sorted(position_data.items()):
+        print(f"Ball #{pos}: {sum(nums)}")
+    print("\n", "-" * 40)
+    print("PREDICTIONS (Top 3 for each Ball Position)")
+    print("-" * 40)
+    for pos, counter in freqs.items():
+        print(f"Ball #{pos}: {[num for num, _ in counter.most_common(3)]}")
+
+    # -------------------------------
+    # SET OF ELEMENTS COLUMN ANALYSIS
+    # -------------------------------
+    columns = list(zip(*historical_data.values()))
+    col_means = [round(sum(col) / len(col), 2) for col in columns]
+    col_freqs = [Counter(col).most_common(1)[0] for col in columns if col]
+    test_point = [sum(col) / len(col) for col in columns]
+    dists = sorted(((math.sqrt(sum((a - b) ** 2 for a, b in zip(nums, test_point))), nums)
+                    for nums in historical_data.values()), key=lambda x: x[0])
+    flat_knn = [n for _, s in dists[:3] for n in s]
+    prediction_CA = [num for num, _ in Counter(flat_knn).most_common(n_balls)]
+    print("\n" + "-" * 40)
+    print("SET OF ELEMENTS COLUMN ANALYSIS")
+    print("-" * 40)
+    print("\n{:<12}{}".format("", "\t".join([f"B{i+1}" for i in range(n_balls)])))
+    print("{:<12}{}".format("MEAN", "\t".join(map(str, col_means))))
+    print("{:<12}{}".format("Frequent", "\t".join([f"{val}:{cnt}" for val, cnt in col_freqs])))
+    print("{:<12}{}".format("KNN", "\t".join(map(str, prediction_CA))))
+    column_avg = [round(m) for m in col_means]
+    print(f"Average when checking from Column: {column_avg}")
+
+    # -------------------------------
+    # FIRST ANTICIPATION SET
+    # -------------------------------
+    number_scores = {i: 0 for i in range(min_number, max_number + 1)}
+    for entry in historical_data.values():
+        for num in entry:
+            number_scores[num] += 1
+        for i in entry:
+            for j in entry:
+                if i != j:
+                    number_scores[i] += 0.1
+    prediction_1st = [num for num, _ in sorted(number_scores.items(), key=lambda x: x[1], reverse=True)[:n_balls]]
+    if not DISABLE_SORTING:
+        prediction_1st = sorted(prediction_1st)
+    print("\n" + "-" * 40)
+    print("FIRST ANTICIPATION SET")
+    print("-" * 40)
+    print(f"Anticipated Elements: {prediction_1st}\n")
+    print(f"✅Reuse 1st Anticipated here: {prediction_1st}")
+
+    # -------------------------------
+    # PAIRS AND TRIPLETS
+    # -------------------------------
+    all_pairs, all_triplets = [], []
+    for draw in historical_data.values():
+        ds = sorted(draw)
+        all_pairs.extend(itertools.combinations(ds, 2))
+        all_triplets.extend(itertools.combinations(ds, 3))
+    pairs, triplets = Counter(all_pairs), Counter(all_triplets)
+    print("-" * 40)
+    print("ELEMETS PAIRS & TRIPLETS")
+    print("-" * 40)
+    print("GROUP OF 2:")
+    for pair, count in pairs.most_common(10):
+        print(f"{pair} appeared {count} times")
+    print("\nGROUP OF 3:")
+    for triplet, count in triplets.most_common(10):
+        print(f"{triplet} appeared {count} times")
+
+    def euclidean(x, y):
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(x, y)))
+
+    def knn_predict_combination(k=3):
+        sets_list = list(historical_data.values())
+        last_set = sorted(sets_list[-1])
+        distances = sorted(((euclidean(last_set, sorted(s)), sorted(s)) for s in sets_list[:-1]), key=lambda x: x[0])
+        neighbor_pairs = []
+        for _, s in distances[:k]:
+            neighbor_pairs.extend(itertools.combinations(s, 2))
+        common = [num for pair, _ in Counter(neighbor_pairs).most_common(n_balls // 2) for num in pair]
+        predicted = list(set(common))
+        if not DISABLE_SORTING:
+            predicted = sorted(predicted)
+        predicted = predicted[:n_balls]
+        while len(predicted) < n_balls:
+            predicted.append(predicted[-1] + 1 if predicted else min_number)
+        return predicted
+
+    def ml_predict_combination(pair_counter):
+        # Same math as before (regression on each pair's cumulative count),
+        # computed with numpy so long histories stay fast.
+        times = np.arange(1, num_sets + 1, dtype=float)
+        pair_list = list(pair_counter.keys())
+        if not pair_list:
+            return [min_number] * n_balls
+        idx = {p: i for i, p in enumerate(pair_list)}
+        pres = np.zeros((len(pair_list), num_sets))
+        for t, s in enumerate(historical_data.values()):
+            for p in itertools.combinations(sorted(s), 2):
+                if p in idx:
+                    pres[idx[p], t] = 1
+        cum = np.cumsum(pres, axis=1)
+        mx = times.mean()
+        ssxx = ((times - mx) ** 2).sum()
+        slope = ((times - mx) * (cum - cum.mean(axis=1, keepdims=True))).sum(axis=1) / ssxx if ssxx else np.zeros(len(pair_list))
+        nxt = cum.mean(axis=1) - slope * mx + slope * (num_sets + 1)
+        order = sorted(range(len(pair_list)), key=lambda i: nxt[i], reverse=True)[:n_balls // 2]
+        common_nums = [num for i in order for num in pair_list[i]]
+        predicted = list(set(common_nums))
+        if not DISABLE_SORTING:
+            predicted = sorted(predicted)
+        predicted = predicted[:n_balls]
+        while len(predicted) < n_balls:
+            predicted.append(predicted[-1] + 1 if predicted else min_number)
+        return predicted
+
+    predicted_knn = knn_predict_combination()
+    print(f"\n✅Anticipated Group Combination (KNN-like) => {predicted_knn}")
+    predictedPair = ml_predict_combination(pairs)
+    print(f"\n✅Anticipated Group Combination (ML-like) => {predictedPair}")
+
+    # -------------------------------
+    # HOT AND COLD NUMBERS
+    # -------------------------------
+    freq_dict = Counter(all_nums_flat)
+    hot_numbers = [num for num, count in freq_dict.items() if count > 1]
+    cold_numbers = [num for num, count in freq_dict.items() if count == 1]
+    top_hot = [num for num, _ in sorted(freq_dict.items(), key=lambda x: x[1], reverse=True)[:n_balls]]
+    print("\n" + "-" * 40)
+    print("HOT AND COLD NUMBERS")
+    print("-" * 40)
+    print("HOT NUMBERS (Appeared >1 times):", hot_numbers)
+    print("COLD NUMBERS (Appeared only once):", cold_numbers)
+    print("\n✅TOP HOT ANTICIPATED:")
+    print(top_hot)
+    possible_mix = top_hot[:n_balls//2] + [num for num in cold_numbers if num not in top_hot][:n_balls//2]
+    print("\n✅POSSIBLE HOT AND COLD ANTICIPATED COMBINATION:")
+    print(possible_mix)
+
+    sets_l = list(historical_data.values())
+    test_set = sets_l[-1]
+    dd = sorted((len(set(test_set) ^ set(sets_l[i])), sets_l[i]) for i in range(len(sets_l) - 1))
+    combined = [num for _, nb in dd[:3] for num in nb]
+    knn_prediction_HaC = [num for num, _ in Counter(combined).most_common(n_balls)]
+    print("\n✅KNN ANTICIPATED COMBINATION BASED ON LAST SET:")
+    print(knn_prediction_HaC)
+
+    # -------------------------------
+    # EVERY 5 SETS MEAN CHECK
+    # -------------------------------
+    keys_sorted = sorted(historical_data.keys(), key=set_key_num)
+    grouped_keys = [keys_sorted[i:i+5] for i in range(0, len(keys_sorted), 5)]
+    mean_results = []
+    for group in grouped_keys:
+        pos_d = [[historical_data[k][i] for k in group] for i in range(n_balls)]
+        mean_results.append((group[0], group[-1], [round(statistics.mean(p), 1) for p in pos_d]))
+    print("\n", "-" * 40)
+    print("EVERY 5 SETS MEAN CHECK")
+    print("-" * 40)
+    for start, end, means in mean_results:
+        print(f"Mean values of {start} to {end}: {means}")
+    group_means = [m for _, _, m in mean_results]
+    group_time = list(range(1, len(group_means) + 1))
+    predicted_group_mean = []
+    for pos in range(n_balls):
+        reg = CustomLinearRegression()
+        reg.fit(group_time, [g[pos] for g in group_means])
+        predicted_group_mean.append(round(reg.predict(len(group_means) + 1)))
+    print(f"✅Predicted EVERY 5 SETS ML: {predicted_group_mean}")
+
+    # -------------------------------
+    # COMBINATION COUNT PER SEGMENT
+    # -------------------------------
+    def get_segments(numbers):
+        segs = []
+        for num in numbers:
+            for start, end in segments_bounds:
+                if start <= num <= end:
+                    segs.append(f"{start}-{end}")
+                    break
+            else:
+                segs.append("Unknown")
+        return segs
+
+    segments_data = {sn: get_segments(nums) for sn, nums in historical_data.items()}
+    combination_counts = Counter(tuple(sorted(s)) for s in segments_data.values())
+    print("\n", "-" * 40)
+    print("COMBINATION COUNT PER SEGMENT")
+    print("-" * 40)
+    for set_name, segs in segments_data.items():
+        print(f'"{set_name}": {segs}')
+    top_5_combinations = combination_counts.most_common(5)
+    print("\n", "-" * 40)
+    print("Top 5 Most Frequent Segment Patterns:")
+    print("-" * 40)
+    for cmb, count in top_5_combinations:
+        print(f"{', '.join(cmb)} => {count} times")
+
+    segment_frequencies = {f"{s}-{e}": Counter() for s, e in segments_bounds}
+    for numbers in historical_data.values():
+        for seg, number in zip(get_segments(numbers), numbers):
+            if seg in segment_frequencies:
+                segment_frequencies[seg][number] += 1
+    print("\n", "-" * 40)
+    print("Number Frequencies per Segment:")
+    print("-" * 40)
+    for seg, fq in segment_frequencies.items():
+        print(f"{seg}: {dict(fq)}")
+
+    weighted_segments = {seg: {} for seg in segment_frequencies}
+    for i, s in enumerate(reversed(all_sets)):
+        for seg, num in zip(get_segments(s), s):
+            if seg in weighted_segments:
+                weighted_segments[seg][num] = weighted_segments[seg].get(num, 0) + 0.9 ** i
+    predicted_combination_seg = []
+    if top_5_combinations:
+        for seg in top_5_combinations[0][0]:
+            d = weighted_segments.get(seg, {})
+            if d:
+                predicted_combination_seg.append(max(d, key=d.get))
+    while len(predicted_combination_seg) < n_balls:
+        predicted_combination_seg.append(random.randint(min_number, max_number))
+    predicted_combination_seg = list(dict.fromkeys(predicted_combination_seg)) if not DISABLE_SORTING else predicted_combination_seg
+    if not DISABLE_SORTING:
+        predicted_combination_seg = sorted(predicted_combination_seg)
+    print("\n✅Anticipated Combination Segment (based on weighted frequency):")
+    print(predicted_combination_seg, "(finalized to a legal ticket in the summary)")
+
+    # -------------------------------
+    # BASED ON POSITION FREQUENCY
+    # -------------------------------
+    recent3 = list(historical_data.values())[-3:]
+    def recency_weight(number):
+        return sum(1 for s in recent3 if number in s) / 3.0 if recent3 else 0
+
+    pre_set_Bsd_Fre = []
+    for fq in freqs.values():
+        if not fq:
+            continue
+        numbers, counts = zip(*fq.items())
+        probs_ = np.array(counts) / np.sum(counts)
+        wp = probs_ * 0.7 + 0.3 * np.array([recency_weight(n) for n in numbers])
+        if np.sum(wp) > 0:
+            wp /= np.sum(wp)
+            pre_set_Bsd_Fre.append(int(np.random.choice(numbers, p=wp)))
+    if not DISABLE_SORTING:
+        pre_set_Bsd_Fre = sorted(pre_set_Bsd_Fre)
+    while len(pre_set_Bsd_Fre) < n_balls:
+        pre_set_Bsd_Fre.append(pre_set_Bsd_Fre[-1] + 1 if pre_set_Bsd_Fre else min_number)
+    pre_set_Bsd_Fre = pre_set_Bsd_Fre[:n_balls]
+    print("\n", "-" * 40)
+    print("BASED ON POSITION FREQUENCY")
+    print("-" * 40)
+    print(pre_set_Bsd_Fre)
+
+    # -------------------------------
+    # ANTICIPATED PROBABILITY
+    # -------------------------------
+    unique_values, counts_ = np.unique(all_nums_flat, return_counts=True)
+    probabilities = counts_ / len(all_nums_flat) * 100
+    sorted_probabilities = dict(sorted(zip(unique_values, probabilities), key=lambda x: x[1], reverse=True))
+    for idx_, (val, prob) in enumerate(sorted_probabilities.items()):
+        if idx_ < n_balls:
+            print(f"{val}\t{prob:.2f}%")
+    predicted_numbers2 = [int(v) for v in list(sorted_probabilities)[:n_balls]]
+    print("\n", "-" * 40)
+    print("ANTICIPATED PROBABILITY")
+    print("-" * 40)
+    print(f"\n✅Anticioated Probability Element:\n {predicted_numbers2}")
+
+    # -------------------------------
+    # SPEED DRAWN
+    # -------------------------------
+    weighted = Counter()
+    for i, numbers in enumerate(reversed(list(historical_data.values()))):
+        for num in numbers:
+            weighted[num] += 0.8 ** i
+    recommended_numbers = [num for num, _ in weighted.most_common(n_balls)]
+    print("\n", "-" * 40)
+    print("SPEED DRAWN BASED ON HISTORICAL VALUE")
+    print("-" * 40)
+    print("✅ SPEED DRAWN:\n", recommended_numbers)
+
+    # -------------------------------
+    # MAPPING OF SETS
+    # -------------------------------
+    def map_sets(hd):
+        mapping = {}
+        keys = list(hd.keys())
+        kidx = {k: i for i, k in enumerate(keys)}
+        for set_name, numbers in hd.items():
+            for i, number in enumerate(numbers):
+                mapping.setdefault(number, []).append((set_name, f"B{i+1}"))
+        mapped = {}
+        for set_name in keys[-10:]:
+            ms, mc = [], []
+            cur_i = kidx[set_name]
+            for number in hd[set_name]:
+                earliest = None
+                for mname, bucket in mapping.get(number, []):
+                    mi = kidx[mname]
+                    if mi < cur_i and (earliest is None or mi > kidx[earliest[0]]):
+                        earliest = (mname, bucket)
+                if earliest:
+                    ms.append(f"{earliest[0]} {earliest[1]}")
+                    b_i = int(earliest[1][1:]) - 1
+                    nxt = kidx[earliest[0]] + 1
+                    mc.append(hd[keys[nxt]][b_i] if nxt < len(keys) and len(hd[keys[nxt]]) > b_i else "N/A")
+                else:
+                    ms.append("N/A"); mc.append("N/A")
+            mapped[set_name] = {"MAP_SET": ms, "MAP_Copy": mc}
+        return mapped
+
+    print("\n", "-" * 40)
+    print('MAPPING LAST 10 SETS OF NUMBER')
+    print("-" * 40)
+    mapped_sets = map_sets(historical_data)
+    for set_name, m in mapped_sets.items():
+        print(f'"{set_name}": {historical_data[set_name]}')
+        print(f'MAP_{set_name}: {m["MAP_SET"]}')
+        print(f'MAP_Copy_{set_name}: {m["MAP_Copy"]}')
+        print()
+
+    # ==========================================
+    # ADAPTIVE LAG MEMORY ENGINE (descriptive)
+    # ==========================================
+    class LagMemoryEngine:
+        def __init__(self, raw_data):
+            self.raw_data = raw_data
+            # FIX: numeric sort (string sort put SET_10 before SET_9)
+            self.set_ids = sorted([k for k in raw_data if k.startswith("SET_")], key=set_key_num)
+            # FIX: ranges follow this game's segments
+            self.ranges = [f"{a}–{b}" for a, b in segments_bounds] + ["Unknown"]
+            self.lag_buckets = {"Lag 1": 0, "Lag 2": 0, "Lag 3": 0, "Lag 4": 0, "Lag 5+": 0}
+            self.range_freq = {r: 0 for r in self.ranges}
+            self.range_persistence = {r: 0 for r in self.ranges}
+            self.memory_scores = {}
+
+        def _get_range(self, val):
+            for a, b in segments_bounds:
+                if a <= val <= b:
+                    return f"{a}–{b}"
+            return "Unknown"
+
+        def _extract_lag(self, map_str, current_set_id):
+            match = re.search(r'SET_(\d+)', map_str)
+            if match:
+                lag = current_set_id - int(match.group(1))
+                if lag == 1: return "Lag 1"
+                elif lag == 2: return "Lag 2"
+                elif lag == 3: return "Lag 3"
+                elif lag == 4: return "Lag 4"
+            return "Lag 5+"
+
+        def process_data(self):
+            for sid in self.set_ids:
+                set_id = set_key_num(sid)
+                elements = self.raw_data[sid]
+                map_data = self.raw_data[f"MAP_{sid}"]
+                raw_score = 0.0
+                l1 = l2 = l3 = l4 = l5 = 0
+                ranges_here = set()
+                for i, map_str in enumerate(map_data):
+                    lag_key = self._extract_lag(map_str, set_id)
+                    if lag_key == "Lag 1": raw_score += 1.0; l1 += 1
+                    elif lag_key == "Lag 2": raw_score += 0.7; l2 += 1
+                    elif lag_key == "Lag 3": raw_score += 0.4; l3 += 1
+                    elif lag_key == "Lag 4": raw_score += 0.2; l4 += 1
+                    else: raw_score += 0.2; l5 += 1
+                    self.lag_buckets[lag_key] += 1
+                    r = self._get_range(elements[i])
+                    self.range_freq[r] += 1
+                    ranges_here.add(r)
+                for r in ranges_here:
+                    self.range_persistence[r] += 1
+                final_score = round((raw_score / n_balls) * 100, 1)
+                if final_score <= 25: cls = "Random / Reset"
+                elif final_score <= 50: cls = "Mixed Memory"
+                elif final_score <= 75: cls = "Stable Memory"
+                else: cls = "Strong Anchored"
+                self.memory_scores[sid] = {"L1": l1, "L2": l2, "L3": l3, "L4+": l4 + l5,
+                                           "Raw": round(raw_score, 1), "Final": final_score, "Class": cls}
+
+        def generate_output(self):
+            total = len(self.set_ids) * n_balls
+            print("\n" + "="*50)
+            print("CEO LAG MEMORY ANALYTICS v3.0  (descriptive - not validated)")
+            print("="*50)
+            print("## 1. LAG HEATMAP SUMMARY\n")
+            print("### LAG INTENSITY TABLE")
+            print("| Lag Depth | Match Density % | System State |")
+            print("| :--- | :--- | :--- |")
+            lb = self.lag_buckets
+            state_map = {
+                "Lag 1": "Severely Decayed" if lb["Lag 1"]/total < 0.15 else "Active",
+                "Lag 2": "Dormant" if lb["Lag 2"]/total < 0.1 else "Weak Pulse",
+                "Lag 3": "Dormant" if lb["Lag 3"]/total < 0.1 else "Weak Pulse",
+                "Lag 4": "Weak Pulse",
+                "Lag 5+": "Deep Memory Anchor" if lb["Lag 5+"]/total > 0.5 else "Active Mid-Term"}
+            for lag, count in lb.items():
+                print(f"| **{lag}** | {round(count/total*100, 1)}% ({count}/{total}) | {state_map[lag]} |")
+            print("\n### RANGE DOMINANCE TABLE")
+            print("| Range | Total Frequency | Dominance Rank | Persistence Score |")
+            print("| :--- | :--- | :--- | :--- |")
+            sorted_ranges = sorted(self.range_freq.items(), key=lambda x: x[1], reverse=True)
+            for rank, (r, count) in enumerate(sorted_ranges, 1):
+                pers = f"{self.range_persistence[r]}/{len(self.set_ids)} Sets ({round(self.range_persistence[r]/len(self.set_ids)*100)}%)"
+                tier = "Primary" if rank <= 2 else ("Secondary" if rank <= 4 else ("Tertiary" if rank == 5 else "Suppressed"))
+                print(f"| **{r}** | {count} / {total} | {rank} ({tier}) | {pers} |")
+            print("\n## 2. MEMORY SCORE TABLE\n")
+            print("| SET_ID | Lag 1 | Lag 2 | Lag 3 | Lag 4+ | Raw Score | Final (0-100) | Classification |")
+            print("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for sid in self.set_ids:
+                m = self.memory_scores[sid]
+                print(f"| **{sid}** | {m['L1']} | {m['L2']} | {m['L3']} | {m['L4+']} | {m['Raw']} | **{m['Final']}** | {m['Class']} |")
+            print("\n## 3. SYSTEM BEHAVIOR\n")
+            avg_recent = np.mean([self.memory_scores[s]["Final"] for s in self.set_ids[-3:]])
+            stability = "LOW" if avg_recent <= 25 else ("MODERATE (Volatile)" if avg_recent <= 50 else "HIGH")
+            l1p, l5p = lb["Lag 1"]/total, lb["Lag 5+"]/total
+            drift = "POSITIVE TEMPORAL DRIFT" if (l1p < 0.15 and l5p > 0.5) else ("NEGATIVE TEMPORAL DRIFT (Recency Bias)" if l1p > 0.3 else "NEUTRAL")
+            depth = "SHALLOW IMMEDIATE / DEEP LONG-TERM" if l1p < 0.15 else ("DEEP IMMEDIATE" if l1p > 0.4 else "MIXED DEPTH")
+            print(f"* **Stability:** {stability}.")
+            print(f"* **Drift:** {drift}.")
+            print(f"* **Memory Depth:** {depth}.\n")
+            print("## 4. ATTRACTOR ZONES\n")
+            attractors = ["Terminal Cluster", "Core Anchor", "Bridge Zone"]
+            for i, (r, count) in enumerate(sorted_ranges[:3]):
+                print(f"* **Rank {i+1}: {r} ({attractors[i]})**")
+            print("\n## 5. NEXT SET RANGE SHARE (descriptive)\n")
+            last_el = self.raw_data[self.set_ids[-1]]
+            raw_probs = [self.range_freq[r] * 0.5 + (10 if any(self._get_range(e) == r for e in last_el) else 0)
+                         for r in self.ranges]
+            pr = np.round(np.array(raw_probs) / np.sum(raw_probs) * 100, 0).astype(int)
+            pr[np.argmax(pr)] += 100 - np.sum(pr)
+            for i, r in enumerate(self.ranges):
+                print(f"{r}   → {pr[i]}%")
+
+    engine_input = {}
+    for sn, m in mapped_sets.items():
+        engine_input[sn] = historical_data[sn]
+        engine_input[f"MAP_{sn}"] = m["MAP_SET"]
+    lag_engine = LagMemoryEngine(engine_input)
+    lag_engine.process_data()
+    lag_engine.generate_output()
+
+    # ============================================================
+    # MARKOV CHAIN TRANSITION PREDICTOR
+    # ============================================================
+    transitions = [{} for _ in range(n_balls)]
+    for i in range(len(all_sets) - 1):
+        for pos in range(n_balls):
+            transitions[pos].setdefault(all_sets[i][pos], Counter())[all_sets[i + 1][pos]] += 1
+    markov_pred = []
+    for pos in range(n_balls):
+        cur = all_sets[-1][pos]
+        if cur in transitions[pos] and transitions[pos][cur]:
+            nv = transitions[pos][cur].most_common(1)[0][0]
+        else:
+            nv = Counter(s[pos] for s in all_sets).most_common(1)[0][0]
+        markov_pred.append(max(min_number, min(max_number, nv)))
+    if not DISABLE_SORTING:
+        markov_pred = sorted(markov_pred)
+    print("\n" + "-" * 40)
+    print("MARKOV CHAIN TRANSITION PREDICTOR")
+    print("-" * 40)
+    print(f"✅ Markov Chain Predicted SET: {markov_pred}")
+
+    # ============================================================
+    # EXPONENTIAL SMOOTHING PREDICTOR
+    # ============================================================
+    smoothed = list(all_sets[0])
+    for s in all_sets[1:]:
+        smoothed = [0.6 * s[i] + 0.4 * smoothed[i] for i in range(len(s))]
+    exp_smooth_pred = [max(min_number, min(max_number, round(v))) for v in smoothed]
+    if not DISABLE_SORTING:
+        exp_smooth_pred = sorted(exp_smooth_pred)
+    print("\n" + "-" * 40)
+    print("EXPONENTIAL SMOOTHING PREDICTOR (alpha=0.6)")
+    print("-" * 40)
+    print(f"✅ Exponential Smoothing Predicted SET: {exp_smooth_pred}")
+
+    # ============================================================
+    # VOLATILITY / STD DEVIATION PREDICTOR
+    # ============================================================
+    print("\n" + "-" * 40)
+    print("VOLATILITY / STD DEVIATION PREDICTOR")
+    print("-" * 40)
+    print("\n  Pos  | Mean   | Std    | Low    | High   | Pick")
+    print("  " + "-" * 50)
+    vol_pred = []
+    for pos in range(n_balls):
+        vals = [s[pos] for s in all_sets]
+        mu = statistics.mean(vals)
+        std = statistics.stdev(vals) if len(vals) > 1 else 0
+        lo, hi = max(min_number, round(mu - std)), min(max_number, round(mu + std))
+        fq = Counter(vals)
+        cands = [v for v in fq if lo <= v <= hi]
+        pick = max(cands, key=lambda x: fq[x]) if cands else fq.most_common(1)[0][0]
+        vol_pred.append(max(min_number, min(max_number, pick)))
+        print(f"  B{pos+1:<4} | {mu:<6.1f} | {std:<6.1f} | {lo:<6} | {hi:<6} | {pick}")
+    if not DISABLE_SORTING:
+        vol_pred = sorted(vol_pred)
+    print(f"✅ Volatility Predicted SET: {vol_pred}")
+
+    # -------------------------------
+    # BEST SCORED SET (half-size subsets removed: they were always filtered out)
+    # -------------------------------
+    candidate_sets = [pre_Deff_set, pre_EandO_set, prediction_AN, Bmost_frequent_numbers,
+                      prediction_1st, predictedPair, knn_prediction_HaC, predicted_combination_seg,
+                      markov_pred, exp_smooth_pred, vol_pred]
+    number_counts = Counter(all_nums_flat)
+    hot_set = {n for n, _ in number_counts.most_common(10)}
+    cold_set = {n for n, _ in number_counts.most_common()[-10:]}
+    last_set_key = keys_sorted[-1]
+    last_draw = historical_data[last_set_key]
+
+    def score_candidate(candidate):
+        seen, segs = set(), set()
+        score = even = odd = 0
+        for num in candidate:
+            if num in seen: score -= 10
+            seen.add(num)
+            if num in hot_set: score += 4
+            if num in cold_set: score -= 1
+            if num in last_draw: score -= 2
+            for k, (a, b) in enumerate(segments_bounds, 1):
+                if a <= num <= b:
+                    segs.add(k); break
+            if num % 2 == 0: even += 1
+            else: odd += 1
+        return score - abs(even - n_balls // 2) * 1.5 + len(segs) * 2
+
+    scored = sorted(((score_candidate(c), c) for c in (list(set(x)) for x in candidate_sets) if len(c) >= n_balls),
+                    key=lambda x: x[0], reverse=True)
+    print(f"Last Draw ({last_set_key}): {last_draw}")
+    print(f"Hot Numbers: {sorted(hot_set)}")
+    print(f"Cold Numbers: {sorted(cold_set)}\n")
+    print("\n", "-" * 40)
+    print("Ranked Predicted Sets:")
+    print("-" * 40)
+    for rank, (sc, s) in enumerate(scored, 1):
+        print(f"{rank}. Set: {s}, Score: {sc}")
+    best_predicted_set = scored[0][1] if scored else []
+    print(f"\n✅ BEST ANTICIPATED SET: {' '.join(map(str, best_predicted_set))}")
+
+    # -------------------------------
+    # UPS PROTOCOL
+    # -------------------------------
+    def get_gaps(s):
+        return [s[i+1] - s[i] for i in range(len(s)-1)] if len(s) >= 2 else []
+
+    def ups_predict():
+        print("\n", "-" * 40)
+        print("--- UPS PROTOCOL – Phase I: Pre-processing ---")
+        print("-" * 40)
+        cols = [[historical_data[k][i] for k in keys_sorted] for i in range(n_balls)]
+        mu_pred = sum(sum(c) / len(c) for c in cols) / n_balls
+        print(f"mu_pred = {mu_pred:.2f}")
+        gaps = [get_gaps(s) for s in all_sets]
+        pred_gaps = [np.mean([g[i] for g in gaps if len(g) > i]) for i in range(n_balls - 1)]
+        print(f"Predicted gaps = {[round(float(g), 1) for g in pred_gaps]}")
+
+        last_set = historical_data[keys_sorted[-1]]   # FIX: numeric order
+        s_pos = []
+        for pos in range(n_balls):
+            sc = {n: 0.0 for n in range(min_number, max_number + 1)}
+            dl = sorted((euclidean(last_set, cur), cur[pos]) for cur in historical_data.values() if cur != last_set)
+            for _, num in dl[:5]:
+                sc[num] += 1.0 / 5
+            mx = max(sc.values()) or 1.0
+            s_pos.append({n: v / mx for n, v in sc.items()})
+
+        th = {n: 0.0 for n in range(min_number, max_number + 1)}
+        cnt_flat = Counter(all_nums_flat)
+        for n in all_nums_flat:
+            th[n] += (cnt_flat[n] / len(all_nums_flat)) * 0.5
+        if len(all_sets) >= 3:
+            for n in all_sets[-3]:
+                if n not in all_sets[-1] and n not in all_sets[-2]:
+                    th[n] += 0.5
+        mx = max(th.values()) or 1.0
+        s_theme = {n: v / mx for n, v in th.items()}
+
+        s_gap = {n: sum(1 for s in all_sets for i in range(1, n_balls) if s[i] == n and (s[i] - s[i-1]) <= 5) / len(all_sets)
+                 for n in range(min_number, max_number + 1)}
+
+        print("\n", "-" * 40)
+        print("--- Phase II & III: Synthesis ---")
+        print("-" * 40)
+        u = {n: 0.35 * sum(s_pos[i].get(n, 0) for i in range(n_balls)) / n_balls + 0.35 * s_gap.get(n, 0) + 0.30 * s_theme.get(n, 0)
+             for n in range(min_number, max_number + 1)}
+        u_rank = sorted(u.items(), key=lambda x: x[1], reverse=True)
+        core_size = n_balls - 2 if n_balls > 2 else n_balls
+        add_size = 2 if n_balls > 2 else 0
+        core = [n for n, _ in u_rank[:core_size]]
+        if not DISABLE_SORTING:
+            core = sorted(core)
+        best_set, best_local, best_err = list(core), -1, float('inf')
+        for cmb in itertools.combinations([n for n, _ in u_rank[core_size:core_size + 6]], add_size):
+            cur = core + list(cmb)
+            if not DISABLE_SORTING:
+                cur = sorted(cur)
+            local = sum(1 for g in get_gaps(cur) if g <= 5)
+            err = abs(sum(cur) / len(cur) - mu_pred)
+            if local > best_local or (local == best_local and err < best_err):
+                best_local, best_err, best_set = local, err, cur
+        print(f"Core {core_size} : {core}")
+        print(f"Best local gaps: {best_local}")
+        print(f"Mean error : {best_err:.2f}")
+        return best_set
+
+    ups_pred = ups_predict()
+    print("\n" + "="*55)
+    print(f"UPS PROTOCOL RESULT – SET_{next_set_number}")
+    print("="*55)
+    print(f"Predicted numbers : {ups_pred}")
+    print("="*55)
+
+    # -------------------------------
+    # UNIFIED PREDICTOR (with genetic search)
+    # -------------------------------
+    feat_freq = Counter(all_nums_flat)
+    feat_pos = {p: Counter(s[p] for s in all_sets) for p in range(n_balls)}
+    feat_pairs = Counter(tuple(sorted((s[i], s[j]))) for s in all_sets for i in range(n_balls) for j in range(i + 1, n_balls))
+    cur_idx = num_sets + 1
+    feat_gaps = {}
+    for n in range(min_number, max_number + 1):
+        last = next((i + 1 for i, s in enumerate(reversed(all_sets)) if n in s), 0)
+        feat_gaps[n] = cur_idx - last - 1 if last else cur_idx
+
+    seg3 = (max_number - min_number + 1) // 3
+    bins3 = [(min_number, min_number + seg3 - 1), (min_number + seg3, min_number + 2 * seg3 - 1), (min_number + 2 * seg3, max_number)]
+    def bin_counts(ind):
+        return [sum(1 for n in ind if a <= n <= b) for a, b in bins3]
+
+    def fit(ind):
+        sc = sum(feat_freq.get(n, 0) * 2 for n in ind)
+        for n in ind:
+            g = feat_gaps.get(n, num_sets + 1)
+            sc += 3 if g >= 10 else 1 if g in (1, 2) else 0
+        if max(bin_counts(ind)) <= (n_balls // 3 + 1):
+            sc += 5
+        return sc
+
+    def gen():
+        r = random.sample(range(min_number, max_number + 1), n_balls)
+        return r if DISABLE_SORTING else sorted(r)
+
+    pop = [gen() for _ in range(50)]
+    full_range = set(range(min_number, max_number + 1))
+    for _ in range(20):
+        pop = sorted(pop, key=fit, reverse=True)[:10]
+        while len(pop) < 50:
+            p1, p2 = random.sample(pop, 2)
+            cp = random.randint(1, n_balls - 1) if n_balls > 1 else 0
+            child = list(dict.fromkeys(p1[:cp] + p2[cp:]))
+            need = n_balls - len(child)
+            if need > 0:
+                child.extend(random.sample(sorted(full_range - set(child)), need))
+            if random.random() < 0.1:
+                avail = sorted(full_range - set(child))
+                if avail:
+                    child[random.randint(0, n_balls - 1)] = random.choice(avail)
+            pop.append(child if DISABLE_SORTING else sorted(child))
+    ga_pred = sorted(pop, key=fit, reverse=True)[0]
+
+    scores_u = {n: 0.0 for n in range(min_number, max_number + 1)}
+    for n, c in feat_freq.items(): scores_u[n] += c * 2
+    for p in feat_pos:
+        for n, c in feat_pos[p].items(): scores_u[n] += c * 1.5
+    for n, g in feat_gaps.items():
+        scores_u[n] += 3 if g >= 10 else (1 if g in (1, 2) else 0)
+    for (a, b), c in feat_pairs.items():
+        if c > 1:
+            scores_u[a] += c; scores_u[b] += c
+    for n in scores_u:
+        g = feat_gaps.get(n, num_sets + 1)
+        scores_u[n] += (feat_freq.get(n, 0) / (g + 1)) * 1.5 if g > 0 else 0
+    for n in ga_pred:
+        scores_u[n] += 5
+    last3 = set(n for s in all_sets[-3:] for n in s)
+    cand = sorted(scores_u, key=scores_u.get, reverse=True)[:n_balls * 2]
+    pred_set, rep = [], 0
+    for n in cand:
+        if n in last3:
+            if rep < n_balls // 3:
+                pred_set.append(n); rep += 1
+        else:
+            pred_set.append(n)
+        if len(pred_set) == n_balls:
+            break
+    for n in cand:
+        if len(pred_set) == n_balls: break
+        if n not in pred_set: pred_set.append(n)
+    if not DISABLE_SORTING:
+        pred_set = sorted(pred_set)
+    # NOTE: the old random "rebalance" swap (random.choice replacement) was
+    # removed - it replaced top-scored numbers with random ones.
+    print("\n" + "-" * 40)
+    print("ANTICIPATION COMPONENT BREAKDOWN")
+    print("-" * 40)
+    for n in pred_set:
+        print(f"{n:<3} | score {scores_u[n]:.1f} | GA {'yes' if n in ga_pred else 'no'}")
+    print("\n✅ FINAL ANTICIPATION")
+    print(f"SET_{next_set_number}: {pred_set}")
+
+    # -------------------------------
+    # DETAILED SET ANALYSIS REPORT
+    # -------------------------------
+    print("\n" + "=" * 30)
+    print("--- Detailed Set Analysis Report ---")
+    print("=" * 30)
+    print(f"{'Set':<8} | {'Values':<25} | {'1stAlt':>6} | {'2ndAlt':>6} | {'Odd':>4} | {'Even':>4} | {'COdd':>4} | {'CEve':>4} | {'Total':>5}")
+    rows = []
+    for k in keys_sorted:
+        v = historical_data[k]
+        r = (sum(v[0::2]), sum(v[1::2]), sum(n for n in v if n % 2), sum(n for n in v if n % 2 == 0),
+             sum(1 for n in v if n % 2), sum(1 for n in v if n % 2 == 0), sum(v))
+        rows.append(r)
+        print(f"{k:<8} | {', '.join(map(str, v)):<25} | {r[0]:>6} | {r[1]:>6} | {r[2]:>4} | {r[3]:>4} | {r[4]:>4} | {r[5]:>4} | {r[6]:>5}")
+
+    # -------------------------------
+    # ENSEMBLES (FIX: no method votes for its own output)
+    # -------------------------------
+    base_methods = {
+        'Diff Regression':    pre_Deff_set,
+        'Even-Odd KNN':       pre_EandO_set,
+        'Position Regression': prediction_AN,
+        'Ball Frequency':     Bmost_frequent_numbers,
+        'First Anticipation': prediction_1st,
+        'Pairs ML':           predictedPair,
+        'Pairs KNN':          predicted_knn,
+        'Hot-Cold KNN':       knn_prediction_HaC,
+        'Top Hot':            top_hot,
+        'Hot-Cold Mix':       possible_mix,
+        'Segment Combo':      predicted_combination_seg,
+        'Position Sample':    pre_set_Bsd_Fre,
+        'Probability Top':    predicted_numbers2,
+        'Speed Drawn':        recommended_numbers,
+        '5-Set Mean ML':      predicted_group_mean,
+        'Column KNN':         prediction_CA,
+        'UPS Protocol':       ups_pred,
+        'Unified Predictor':  pred_set,
+        'Markov Chain':       markov_pred,
+        'Exp Smoothing':      exp_smooth_pred,
+        'Volatility':         vol_pred,
+    }
+    vote = Counter(n for p in base_methods.values() if p for n in set(p))
+    ensemble_vote = [n for n, _ in vote.most_common(n_balls)]
+    if not DISABLE_SORTING:
+        ensemble_vote = sorted(ensemble_vote)
+    print("\n" + "-" * 40)
+    print("ENSEMBLE PREDICTIONS (base methods only)")
+    print("-" * 40)
+    print(f"✅ Ensemble Majority Vote: {ensemble_vote}")
+
+    names = list(base_methods)
+    weights_m = {}
+    for i, nm in enumerate(names):
+        mine = set(base_methods[nm] or [])
+        weights_m[nm] = max(sum(len(mine & set(base_methods[o] or [])) for o in names if o != nm), 1)
+    wsc = Counter()
+    for nm, p in base_methods.items():
+        for n in set(p or []):
+            wsc[n] += weights_m[nm]
+    weighted_consensus_pred = [n for n, _ in wsc.most_common(n_balls)]
+    if not DISABLE_SORTING:
+        weighted_consensus_pred = sorted(weighted_consensus_pred)
+    print(f"✅ Weighted Consensus Predicted SET: {weighted_consensus_pred}")
+
+    # -------------------------------
+    # DUE / ZERO-FREQUENCY / BALANCED
+    # -------------------------------
+    gaps_due = {}
+    for e in range(min_number, max_number + 1):
+        ls = 0
+        for i_, els in enumerate(all_sets, 1):
+            if e in els: ls = i_
+        gaps_due[e] = num_sets - ls
+    due_scores = {e: (g * 2 if g >= 5 else (-5 if g == 0 else g * 0.5)) for e, g in gaps_due.items()}
+    anticipated_due = [e for e, _ in sorted(due_scores.items(), key=lambda x: x[1], reverse=True)[:n_balls]]
+    print(f"\n✅ DUE ELEMENTS ANTICIPATION: {anticipated_due}")
+
+    never_drawn = sorted(full_range - set(all_nums_flat))
+    rare = [e for e, c in feat_freq.items() if 1 <= c <= 2]
+    medium = [e for e, c in feat_freq.items() if 3 <= c <= 4]
+    hot10 = [e for e, _ in feat_freq.most_common(10)]
+    rare_mix = random.sample(never_drawn, min(2, len(never_drawn))) + random.sample(rare, min(n_balls - 2, len(rare)))
+    rare_mix = rare_mix[:n_balls] if DISABLE_SORTING else sorted(rare_mix[:n_balls])
+    balanced = (random.sample(never_drawn, min(1, len(never_drawn))) + random.sample(rare, min(2, len(rare))) +
+                random.sample(medium, min(2, len(medium))) + random.sample(hot10, min(1, len(hot10))))
+    balanced = balanced[:n_balls] if DISABLE_SORTING else sorted(balanced[:n_balls])
+    print(f"✅ NEVER DRAWN ELEMENTS: {never_drawn}")
+    print(f"✅ RARE MIX ANTICIPATION: {rare_mix}")
+    print(f"✅ BALANCED ANTICIPATION: {balanced}")
+
+    all_preds_named = dict(base_methods)
+    all_preds_named.update({
+        'Best Scored':        best_predicted_set,
+        'Ensemble Vote':      ensemble_vote,
+        'Weighted Consensus': weighted_consensus_pred,
+        'Due Elements':       anticipated_due,
+        'Rare Mix':           rare_mix,
+        'Balanced':           balanced,
+    })
+
+    # FINALIZE every pick into a legal ticket (fallback = frequency rank)
+    fallback = sorted(range(min_number, max_number + 1), key=lambda n: (-feat_freq.get(n, 0), n))
+    final = {}
+    changed = []
+    for nm, p in all_preds_named.items():
+        f_ = finalize_pick(p, cfg, fallback)
+        final[nm] = f_
+        if list(p or []) != f_:
+            changed.append(nm)
+
+    print("\n" + "=" * 50)
+    print("SUMMARY OF ANTICIPATIONS (finalized legal tickets)")
+    print("=" * 50)
+    for nm, p in final.items():
+        print(f"{nm:<22} {p}{'   *finalized' if nm in changed else ''}")
+    print("*finalized = raw output had repeats, wrong length or out-of-range values and was made legal")
+    print(f"\n✅Average when checking from Column: {column_avg}")
+
+    pair_over = {}
+    for m1, m2 in combinations(final, 2):
+        pair_over[f"{m1} / {m2}"] = len(set(final[m1]) & set(final[m2]))
+    print("\nTop method overlaps (descriptive: shared numbers, NOT independent confirmation):")
+    for k, v in sorted(pair_over.items(), key=lambda x: x[1], reverse=True)[:8]:
+        print(f"  {k}: {v}")
+    return final
+
+
+# ===============================================
+# WALK-FORWARD BACKTEST (replaces the old in-sample backtest_hits)
+# ===============================================
+def as_dict(draws):
+    return {f"SET_{i+1}": list(d) for i, d in enumerate(draws)}
+
+def walk_forward(type_name, draws):
+    """Predict draw t from draws[:t] only, score against draws[t]."""
+    cfg = TYPE_CONFIG[type_name]
+    start = max(MIN_HISTORY, len(draws) - MAX_TRIALS)
+    hits, failures = defaultdict(list), 0
+    for t in range(start, len(draws)):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                preds = analyze_type(type_name, as_dict(draws[:t]))
+        except Exception as e:
+            failures += 1
+            continue
+        for m, p in preds.items():
+            hits[m].append(score_pick(p, draws[t], cfg))
+    return hits, failures
+
+def run_validation(histories):
+    print("\n" + "=" * 70)
+    print("WALK-FORWARD VALIDATION vs RANDOM BASELINE (all types)")
+    print("=" * 70)
+    rows = []
+    for tn, draws in histories.items():
+        cfg = TYPE_CONFIG[tn]
+        n_trials_possible = max(0, len(draws) - MIN_HISTORY)
+        if n_trials_possible < TRIAL_FLOOR:
+            print(f"{tn}: only {len(draws)} draws -> {n_trials_possible} trials "
+                  f"(need {MIN_HISTORY + TRIAL_FLOOR}+ draws). Too few to test. "
+                  f"Treat this type's picks as untested.")
+            continue
+        print(f"{tn}: backtesting {min(n_trials_possible, MAX_TRIALS)} trials ...", flush=True)
+        hits, fails = walk_forward(tn, draws)
+        if fails:
+            print(f"  WARNING {tn}: {fails} trial(s) crashed and were skipped")
+        pk = null_distribution(cfg)
+        for m, h in hits.items():
+            rows.append({"type": tn, "method": m, "trials": len(h), "total": sum(h),
+                         "avg": sum(h) / len(h) if h else 0.0,
+                         "null_avg": float((pk * np.arange(len(pk))).sum()),
+                         "best": max(h, default=0),
+                         "raw_p": p_total_at_least(sum(h), len(h), pk) if h else 1.0})
+    if not rows:
+        return {}
+    adj = bh_adjust(np.array([r["raw_p"] for r in rows]))
+    for r, a in zip(rows, adj):
+        r["bh_p"] = float(a)
+        r["cleared"] = r["bh_p"] < ALPHA and r["trials"] >= TRIAL_FLOOR
+    print(f"\nTests in this run: {len(rows)} (type x method). BH correction across all of them.")
+    out = defaultdict(dict)
+    for tn in histories:
+        tr = sorted([r for r in rows if r["type"] == tn], key=lambda r: r["raw_p"])
+        if not tr:
+            continue
+        print(f"\n--- {tn} ({TYPE_CONFIG[tn]['name']}) | random ticket avg {tr[0]['null_avg']:.3f} ---")
+        print(f"{'method':<22} {'trials':>6} {'avg':>6} {'best':>4} {'raw_p':>7} {'BH_p':>7}  verdict")
+        for r in tr:
+            v = "CLEARED (past data only)" if r["cleared"] else "no edge"
+            print(f"{r['method']:<22} {r['trials']:>6} {r['avg']:>6.3f} {r['best']:>4} {r['raw_p']:>7.3f} {r['bh_p']:>7.3f}  {v}")
+            out[tn][r["method"]] = r
+    return out
+
+def find_best(type_name, final_picks, stats):
+    """New rule: only a method that cleared BH can be 'best'. Otherwise: no edge."""
+    cfg = TYPE_CONFIG[type_name]
+    st = stats.get(type_name, {})
+    cleared = sorted([m for m, r in st.items() if r["cleared"]], key=lambda m: -st[m]["avg"])
+    print(f"\n### {type_name} ({cfg['name']}) - SELECTION")
+    if not st:
+        print("UNTESTED: not enough history to backtest. Every pick below is unvalidated.")
+    elif cleared:
+        b = cleared[0]
+        print(f"Best validated method: {b} -> {final_picks[b]}  "
+              f"(avg {st[b]['avg']:.2f} vs {st[b]['null_avg']:.2f}, BH_p {st[b]['bh_p']:.3f})")
+        print("This describes past data. It does not make the next draw more likely to match.")
+    else:
+        print("NO EDGE: no method beat a random ticket after correction. All picks below have equal odds.")
+    if not cfg["positional"]:
+        print("Popularity flags (affect jackpot sharing only, not odds):")
+    for m, p in final_picks.items():
+        tag = f"avg {st[m]['avg']:.2f}, BH_p {st[m]['bh_p']:.2f}" if m in st else "untested"
+        print(f"  {m:<22} {p}  [{tag}]  popularity: {popularity_flags(p, cfg)}")
+
+
+# ===============================================
+# OPTIONAL DEEP LEARNING (UNVALIDATED)
+# ===============================================
+def run_deep_learning(type_name, draws, final_picks):
+    cfg = TYPE_CONFIG[type_name]
+    try:
+        import tensorflow as tf
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
+        from sklearn.preprocessing import MinMaxScaler
+    except ImportError:
+        print("TensorFlow not available. Install: pip install tensorflow scikit-learn")
+        return
+    tf.random.set_seed(SEED)
+    n = cfg["n_slots"]
+    seq = np.array(draws, dtype=np.float32)
+    if len(seq) < 4:
+        print("Not enough data for deep learning (need at least 4 sets)")
+        return
+    lookback = min(3, len(seq) - 1)
+    X = np.array([seq[i:i+lookback] for i in range(len(seq) - lookback)])
+    y = np.array([seq[i+lookback] for i in range(len(seq) - lookback)])
+    sc = MinMaxScaler().fit(seq)
+    Xs = sc.transform(X.reshape(-1, n)).reshape(X.shape)
+    ys = sc.transform(y)
+    preds = {}
+    for name, Layer in (("LSTM", LSTM), ("GRU", GRU)):
+        m = Sequential([Layer(64, return_sequences=True, input_shape=(lookback, n)), Dropout(0.3),
+                        Layer(32), Dropout(0.3), Dense(32, activation='relu'), Dense(n)])
+        m.compile(optimizer='adam', loss='mse')
+        m.fit(Xs, ys, epochs=50, batch_size=min(16, len(Xs)), verbose=0)
+        raw = sc.inverse_transform(m.predict(sc.transform(seq[-lookback:]).reshape(1, lookback, n), verbose=0)).flatten()
+        fallback = sorted(range(cfg["min_val"], cfg["max_val"] + 1), key=lambda v: (-sum(d.count(v) for d in draws), v))
+        preds[name] = finalize_pick(list(raw), cfg, fallback)
+    print("\n" + "=" * 70)
+    print(f"DEEP LEARNING ({type_name}) - UNVALIDATED: not walk-forward tested")
+    print("=" * 70)
+    for k, v in preds.items():
+        print(f"{k:<6} -> {v}")
+
+
+# ===============================================
+# SELF-TEST: planted controls for the validation layer
+# ===============================================
+def selftest():
+    global MAX_TRIALS
+    saved = MAX_TRIALS
+    MAX_TRIALS = 80
+    rng = np.random.default_rng(7)
+    ok = True
+
+    print("### NULL CONTROL (Type8, 100 random draws): expect nothing to clear")
+    null = [sorted(int(x) for x in rng.choice(58, 6, replace=False) + 1) for _ in range(100)]
+    s = run_validation({"Type8": null})
+    n_clear = sum(r["cleared"] for r in s.get("Type8", {}).values())
+    print(f"=> {n_clear} cleared -> {'PASS' if n_clear == 0 else 'FAIL'}")
+    ok &= n_clear == 0
+
+    print("\n### POSITIVE CONTROL (Type8, 100 draws, 3 balls always from {7,21,33,48,52,55}): expect 'Top Hot' to clear")
+    fav = [7, 21, 33, 48, 52, 55]
+    rig = []
+    for _ in range(100):
+        a = [int(x) for x in rng.choice(fav, 3, replace=False)]
+        b = [int(x) for x in rng.choice([v for v in range(1, 59) if v not in a], 3, replace=False)]
+        rig.append(sorted(a + b))
+    s = run_validation({"Type8": rig})
+    hit = s.get("Type8", {}).get("Top Hot", {}).get("cleared", False)
+    print(f"=> Top Hot cleared: {hit} -> {'PASS' if hit else 'FAIL'}")
+    ok &= hit
+
+    print("\n### POSITIONAL CONTROL (Type1, 100 draws, first digit always 7): expect 'Ball Frequency' to clear")
+    pos = [[7] + [int(x) for x in rng.integers(0, 10, 2)] for _ in range(100)]
+    s = run_validation({"Type1": pos})
+    hit = s.get("Type1", {}).get("Ball Frequency", {}).get("cleared", False)
+    print(f"=> Ball Frequency cleared: {hit} -> {'PASS' if hit else 'FAIL'}")
+    ok &= hit
+
+    print("\n### FINALIZE CONTROL: duplicates and out-of-range values become a legal ticket")
+    f = finalize_pick([14, 34, 34, 41, 41, 54], TYPE_CONFIG["Type8"], list(range(1, 59)))
+    g = finalize_pick([12, -3, 4], TYPE_CONFIG["Type1"], [5, 6])
+    good = (len(set(f)) == 6 and f == sorted(f) and g == [9, 0, 4])
+    print(f"=> {f} / {g} -> {'PASS' if good else 'FAIL'}")
+    ok &= good
+
+    MAX_TRIALS = saved
+    print(f"\nSELFTEST {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# ===============================================
+# MAIN
+# ===============================================
+def main():
+    histories = {}
+    for tn in TYPE_CONFIG:
+        if tn in CSV_PATHS:
+            histories[tn] = load_csv(CSV_PATHS[tn])
+        elif tn in data_types:
+            d = data_types[tn]
+            histories[tn] = [d[k] for k in sorted(d, key=set_key_num)]
+
+    for tn, draws in histories.items():
+        for p in validate_draws(tn, draws):
+            print(f"DATA FLAG {tn}: {p}")
+        if len(draws) < MIN_HISTORY + TRIAL_FLOOR:
+            print(f"NOTE {tn}: {len(draws)} draws loaded - looks like sample/demo data; "
+                  f"backtest needs {MIN_HISTORY + TRIAL_FLOOR}+.")
+
+    for tn, draws in histories.items():
+        all_type_predictions[tn] = analyze_type(tn, as_dict(draws))
+
+    stats = run_validation(histories) if RUN_BACKTEST else {}
+    if not RUN_BACKTEST:
+        print("\nBACKTEST SKIPPED (RUN_BACKTEST = False): every pick is unvalidated.")
+
+    print("\n" + "=" * 70)
+    print("SELECTION (validated picks only count as 'best')")
+    print("=" * 70)
+    for tn, picks in all_type_predictions.items():
+        if picks:
+            find_best(tn, picks, stats)
+
+    for tn, res in RESULTS.items():
+        if tn not in all_type_predictions or not res:
+            continue
+        cfg = TYPE_CONFIG[tn]
+        print(f"\n=== RESULT CHECK {tn}: {res} (scored after picking; never added to history) ===")
+        for m, p in all_type_predictions[tn].items():
+            print(f"  {m:<22} {score_pick(p, res, cfg)} match(es)")
+        pk = null_distribution(cfg)
+        print(f"  Random ticket expectation: {(pk * np.arange(len(pk))).sum():.2f}. One draw proves nothing.")
+
+    if RUN_DEEP_LEARNING:
+        last = list(histories)[-1]
+        run_deep_learning(last, histories[last], all_type_predictions.get(last, {}))
+
+    print(f"\n✅ Script completed.")
+
+if __name__ == "__main__":
+    in_notebook = "ipykernel" in sys.modules
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--quick", action="store_true", help="skip the backtest")
+    a, _ = ap.parse_known_args()      # ignores Jupyter's -f argument
+    if a.quick:
+        RUN_BACKTEST = False
+    if a.selftest:
+        ok = selftest()
+        if not in_notebook:
+            sys.exit(0 if ok else 1)
+    else:
+        main()
